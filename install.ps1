@@ -8,6 +8,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+if ($env:CCP_REPO) { $Repo = $env:CCP_REPO }
+if ($env:CCP_VERSION) { $Version = $env:CCP_VERSION }
+if ($env:INSTALL_DIR) { $InstallDir = $env:INSTALL_DIR }
+
 $BinaryName = "ccp.exe"
 $AssetName = "ccp-windows-amd64.zip"
 

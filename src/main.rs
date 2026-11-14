@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 println!("Portal detected at: {}", gateway_base);
                 set_cached_gateway(&gateway_base);
-                post_login(&client, &login_xml_url, username, password)?;
+                probe::post_login(&client, &login_xml_url, username, password)?;
                 return Ok(());
             }
 
@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } => {
                                 println!("Portal detected at: {}", gateway_base);
                                 set_cached_gateway(&gateway_base);
-                                post_login(&client, &login_xml_url, username, password)?;
+                                probe::post_login(&client, &login_xml_url, username, password)?;
                             }
                             ProbeResult::InterfaceOffline => {
                                 println!("Interface still offline after Wi-Fi connect attempt.");
@@ -113,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let fallback_url =
                                         format!("{}/login.xml", gw.trim_end_matches('/'));
                                     println!("Attempting fallback login at: {}", fallback_url);
-                                    post_login(&client, &fallback_url, username, password)?;
+                                    probe::post_login(&client, &fallback_url, username, password)?;
                                 }
                             }
                         }
@@ -130,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(gw) = cached_gateway {
                     let fallback_url = format!("{}/login.xml", gw.trim_end_matches('/'));
                     println!("Attempting cached gateway fallback: {}", fallback_url);
-                    post_login(&client, &fallback_url, username, password)?;
+                    probe::post_login(&client, &fallback_url, username, password)?;
                 } else {
                     println!("Unable to detect portal and no cached gateway is available.");
                 }
@@ -146,125 +146,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn post_login(
-    client: &reqwest::blocking::Client,
-    login_xml_url: &str,
-    username: &str,
-    password: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Authenticating at: {}", login_xml_url);
-
-    let result = submit_login_post(client, login_xml_url, username, password);
-    let resp = match result {
-        Ok(r) => r,
-        Err(e) => {
-            // HTTPS vs. HTTP auto-retry:
-            // Some subnets use http:// while others enforce https:// with self-signed certs.
-            let alt_url = if login_xml_url.starts_with("http://") {
-                login_xml_url.replacen("http://", "https://", 1)
-            } else if login_xml_url.starts_with("https://") {
-                login_xml_url.replacen("https://", "http://", 1)
-            } else {
-                return Err(Box::new(e));
-            };
-            println!("Initial POST failed ({}), retrying with: {}", e, alt_url);
-            submit_login_post(client, &alt_url, username, password)?
-        }
-    };
-
-    let status = resp.status();
-    let body = resp.text().unwrap_or_default();
-    println!("HTTP Status: {}", status.as_u16());
-
-    let body_lower = body.to_lowercase();
-    let failure_messages = [
-        "invalid username",
-        "invalid password",
-        "incorrect password",
-        "authentication failed",
-        "login failed",
-        "wrong password",
-        "invalid credentials",
-        "maximum login limit reached",
-        "account expired",
-        "access denied",
-    ];
-
-    if failure_messages.iter().any(|msg| body_lower.contains(msg)) {
-        println!("Authentication failed. Check your username and password.");
-        return Ok(());
-    }
-
-    if status.is_success() || status.is_redirection() {
-        println!("Login request completed.");
-        println!("Check your internet connection to confirm authentication.");
-    } else {
-        println!(
-            "Unexpected response from captive portal (HTTP {}).",
-            status.as_u16()
-        );
-    }
-
-    Ok(())
-}
-
-fn submit_login_post(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    username: &str,
-    password: &str,
-) -> Result<reqwest::blocking::Response, reqwest::Error> {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-
-    let params = [
-        ("mode", "191"),
-        ("username", username),
-        ("password", password),
-        ("a", &now_ms.to_string()),
-        ("producttype", "0"),
-        ("inputStr", ""),
-        ("escapeUser", username),
-        ("preauthid", ""),
-        ("user", username),
-        ("passwd", password),
-        ("ok", "Login"),
-    ];
-
-    client
-        .post(url)
-        .header(reqwest::header::CACHE_CONTROL, "no-cache")
-        .header(reqwest::header::CONNECTION, "close")
-        .form(&params)
-        .send()
-}
-
-fn get_config_dir() -> PathBuf {
-    if let Some(config_dir) = dirs::config_dir() {
-        let p = config_dir.join("ccp");
-        if p.exists() || !cfg!(target_os = "windows") {
-            return p;
-        }
-    }
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".config").join("ccp");
-    }
-    if let Ok(profile) = env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
-        return PathBuf::from(profile).join(".config").join("ccp");
-    }
-    PathBuf::from(".config/ccp")
-}
-
 fn credentials_path() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        let legacy = home.join(".config").join("ccp").join("credentials.txt");
+    // 1. Check legacy $HOME/.config/ccp/credentials.txt (exact original main branch path)
+    if let Ok(home) = env::var("HOME") {
+        let legacy = PathBuf::from(home)
+            .join(".config")
+            .join("ccp")
+            .join("credentials.txt");
         if legacy.exists() {
             return legacy;
         }
     }
-    get_config_dir().join("credentials.txt")
+
+    // 2. Check dirs::home_dir()/.config/ccp/credentials.txt
+    if let Some(home) = dirs::home_dir() {
+        let p = home.join(".config").join("ccp").join("credentials.txt");
+        if p.exists() {
+            return p;
+        }
+    }
+
+    // 3. Check dirs::config_dir()/ccp/credentials.txt
+    if let Some(config_dir) = dirs::config_dir() {
+        let p = config_dir.join("ccp").join("credentials.txt");
+        if p.exists() {
+            return p;
+        }
+    }
+
+    // 4. Check %USERPROFILE%/.config/ccp/credentials.txt
+    if let Ok(profile) = env::var("USERPROFILE") {
+        let p = PathBuf::from(profile)
+            .join(".config")
+            .join("ccp")
+            .join("credentials.txt");
+        if p.exists() {
+            return p;
+        }
+    }
+
+    // Default destination for writing new credentials:
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".config")
+            .join("ccp")
+            .join("credentials.txt");
+    }
+    if let Some(home) = dirs::home_dir() {
+        return home.join(".config").join("ccp").join("credentials.txt");
+    }
+    if let Ok(profile) = env::var("USERPROFILE") {
+        return PathBuf::from(profile)
+            .join(".config")
+            .join("ccp")
+            .join("credentials.txt");
+    }
+
+    PathBuf::from(".config/ccp/credentials.txt")
+}
+
+fn get_config_dir() -> PathBuf {
+    let creds = credentials_path();
+    if let Some(parent) = creds.parent() {
+        parent.to_path_buf()
+    } else {
+        PathBuf::from(".config/ccp")
+    }
 }
 
 fn cached_gateway_path() -> PathBuf {

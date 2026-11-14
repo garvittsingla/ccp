@@ -1,4 +1,4 @@
-use ccp::probe::{ProbeResult, build_fast_client, extract_gateway_base, probe_url};
+use ccp::probe::{ProbeResult, build_fast_client, extract_gateway_base, post_login, probe_url};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
@@ -71,4 +71,69 @@ fn test_integration_extract_gateway_base() {
     let text = "<form action=\"http://172.16.68.6:8090/login.xml\" method=\"post\">";
     let base = extract_gateway_base(text);
     assert_eq!(base, Some("http://172.16.68.6:8090".to_string()));
+}
+
+#[test]
+fn test_e2e_firefox_redirect_to_sophos_login_xml() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind e2e mock server");
+    let port = listener.local_addr().unwrap().port();
+    let probe_url_str = format!("http://127.0.0.1:{port}/success.txt");
+
+    let handle = std::thread::spawn(move || {
+        // Step 1: Intercept probe with 302 Found redirect
+        if let Ok((mut stream1, _)) = listener.accept() {
+            let mut buf = [0u8; 2048];
+            let _ = stream1.read(&mut buf);
+            let redirect_response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/httpclient.html?u=http://detectportal.firefox.com/success.txt\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream1.write_all(redirect_response.as_bytes());
+            let _ = stream1.flush();
+        }
+
+        // Step 2: Accept POST /login.xml with special chars in password and return LIVE XML
+        if let Ok((mut stream2, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let n = stream2.read(&mut buf).unwrap_or(0);
+            let req_str = String::from_utf8_lossy(&buf[..n]);
+
+            // Assert that password with & and = was properly URL-encoded
+            assert!(
+                req_str.contains("password=Chitkara%26Pass%3D123"),
+                "Expected url-encoded password in POST body. Received request:\n{}",
+                req_str
+            );
+
+            let xml_body = "<requestresponse><status><![CDATA[LIVE]]></status><message><![CDATA[You are signed in as testuser]]></message></requestresponse>";
+            let login_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                xml_body.len(),
+                xml_body
+            );
+            let _ = stream2.write_all(login_response.as_bytes());
+            let _ = stream2.flush();
+        }
+    });
+
+    let client = build_fast_client(false).expect("Client build failed");
+    let probe_result = probe_url(&client, &probe_url_str, None);
+    match probe_result {
+        ProbeResult::LockedPortal {
+            gateway_base,
+            login_xml_url,
+        } => {
+            assert_eq!(gateway_base, format!("http://127.0.0.1:{port}"));
+            assert_eq!(login_xml_url, format!("http://127.0.0.1:{port}/login.xml"));
+
+            let login_res = post_login(&client, &login_xml_url, "testuser", "Chitkara&Pass=123");
+            assert!(
+                login_res.is_ok(),
+                "Expected post_login to succeed, but got: {:?}",
+                login_res
+            );
+        }
+        other => panic!("Expected LockedPortal probe result, got: {:?}", other),
+    }
+
+    handle.join().unwrap();
 }
