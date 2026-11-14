@@ -8,10 +8,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-if ($env:CCP_REPO) { $Repo = $env:CCP_REPO }
-if ($env:CCP_VERSION) { $Version = $env:CCP_VERSION }
-if ($env:INSTALL_DIR) { $InstallDir = $env:INSTALL_DIR }
-
 $BinaryName = "ccp.exe"
 $AssetName = "ccp-windows-amd64.zip"
 
@@ -61,8 +57,10 @@ try {
     # Check and update User PATH
     $UserPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::User)
     $PathParts = ($UserPath -split ';') | Where-Object { $_ -ne '' }
+    $NormalizedInstallDir = $InstallDir.TrimEnd('\')
+    $AlreadyInPath = $PathParts | Where-Object { $_.TrimEnd('\') -ieq $NormalizedInstallDir }
 
-    if ($PathParts -notcontains $InstallDir) {
+    if (-not $AlreadyInPath) {
         Write-Host ""
         Write-Host "[WARN] $InstallDir is not in your User PATH." -ForegroundColor Yellow
         Write-Host "Adding $InstallDir to your User PATH..." -ForegroundColor Cyan

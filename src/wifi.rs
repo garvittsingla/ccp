@@ -27,12 +27,23 @@ pub fn connect_wifi(ssid: Option<&str>) -> std::io::Result<()> {
         s.to_string()
     } else {
         // Find existing WLAN profiles
-        let output = Command::new("netsh")
+        let profiles_output = Command::new("netsh")
             .args(["wlan", "show", "profiles"])
             .creation_flags(CREATE_NO_WINDOW)
             .output()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        find_preferred_wlan_profile(&stdout).unwrap_or_default()
+        let profiles_stdout = String::from_utf8_lossy(&profiles_output.stdout);
+
+        // Find visible networks currently in-range
+        let networks_output = Command::new("netsh")
+            .args(["wlan", "show", "networks"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok();
+        let networks_stdout =
+            networks_output.map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+
+        find_preferred_wlan_profile_in_range(&profiles_stdout, networks_stdout.as_deref())
+            .unwrap_or_default()
     };
 
     if !target_profile.is_empty() {
@@ -47,15 +58,38 @@ pub fn connect_wifi(ssid: Option<&str>) -> std::io::Result<()> {
 
 #[cfg(target_os = "windows")]
 pub fn find_preferred_wlan_profile(profiles_output: &str) -> Option<String> {
+    find_preferred_wlan_profile_in_range(profiles_output, None)
+}
+
+#[cfg(target_os = "windows")]
+pub fn find_preferred_wlan_profile_in_range(
+    profiles_output: &str,
+    networks_output: Option<&str>,
+) -> Option<String> {
     let mut profiles = Vec::new();
+    let mut in_profiles_section = false;
+
     for line in profiles_output.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("----") {
+            in_profiles_section = true;
+            continue;
+        }
+
         if let Some(idx) = line.find(':') {
-            let key = line[..idx].trim().to_lowercase();
-            if key.contains("profile") {
-                let name = line[idx + 1..].trim();
-                if !name.is_empty() {
-                    profiles.push(name.to_string());
+            let left = line[..idx].trim().to_lowercase();
+            let right = line[idx + 1..].trim();
+
+            if in_profiles_section {
+                if !right.is_empty() && right != "<None>" && right != "<none>" {
+                    profiles.push(right.to_string());
                 }
+            } else if (left.contains("profile") || left.contains("profil"))
+                && !right.is_empty()
+                && right != "<None>"
+                && right != "<none>"
+            {
+                profiles.push(right.to_string());
             }
         }
     }
@@ -64,16 +98,47 @@ pub fn find_preferred_wlan_profile(profiles_output: &str) -> Option<String> {
         return None;
     }
 
+    // If networks_output is provided, filter candidate profiles to those currently in range
+    let in_range_profiles: Vec<String> = if let Some(net_out) = networks_output {
+        let mut visible_ssids = Vec::new();
+        for line in net_out.lines() {
+            if let Some(idx) = line.find(':') {
+                let left = line[..idx].trim().to_lowercase();
+                let right = line[idx + 1..].trim();
+                if left.starts_with("ssid") && !right.is_empty() {
+                    visible_ssids.push(right.to_lowercase());
+                }
+            }
+        }
+
+        let filtered: Vec<String> = profiles
+            .iter()
+            .filter(|p| visible_ssids.contains(&p.to_lowercase()))
+            .cloned()
+            .collect();
+
+        if !filtered.is_empty() {
+            filtered
+        } else {
+            profiles
+        }
+    } else {
+        profiles
+    };
+
     // Prioritize campus / hostel / college Wi-Fi names
     let keywords = ["hostel", "college", "campus", "wifi", "eduroam", "student"];
     for keyword in &keywords {
-        if let Some(p) = profiles.iter().find(|p| p.to_lowercase().contains(keyword)) {
+        if let Some(p) = in_range_profiles
+            .iter()
+            .find(|p| p.to_lowercase().contains(keyword))
+        {
             return Some(p.clone());
         }
     }
 
-    // Default to the first profile if no keyword matches
-    profiles.into_iter().next()
+    // Default to the first in-range profile if no keyword matches
+    in_range_profiles.into_iter().next()
 }
 
 #[cfg(target_os = "linux")]
@@ -91,15 +156,42 @@ pub fn connect_wifi(ssid: Option<&str>) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+fn get_macos_wifi_device() -> String {
+    use std::process::Command;
+    if let Ok(output) = Command::new("networksetup")
+        .arg("-listallhardwareports")
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut found_wifi = false;
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains("Wi-Fi") || trimmed.contains("AirPort") {
+                found_wifi = true;
+            } else if found_wifi && trimmed.starts_with("Device:") {
+                if let Some(dev) = trimmed.split(':').nth(1) {
+                    let dev = dev.trim();
+                    if !dev.is_empty() {
+                        return dev.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "en0".to_string()
+}
+
+#[cfg(target_os = "macos")]
 pub fn connect_wifi(ssid: Option<&str>) -> std::io::Result<()> {
     use std::process::Command;
+    let dev = get_macos_wifi_device();
     if let Some(s) = ssid {
         let _ = Command::new("networksetup")
-            .args(["-setairportnetwork", "en0", s])
+            .args(["-setairportnetwork", &dev, s])
             .output();
     } else {
         let _ = Command::new("networksetup")
-            .args(["-setairportpower", "en0", "on"])
+            .args(["-setairportpower", &dev, "on"])
             .output();
     }
     Ok(())
@@ -133,5 +225,29 @@ User profiles
 ";
         let found = find_preferred_wlan_profile(sample);
         assert_eq!(found, Some("Campus_Hostel_Net".to_string()));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_find_preferred_wlan_profile_in_range_filtering() {
+        let profiles = "
+User profiles
+-------------
+    All User Profile     : Campus_Hostel_Net
+    All User Profile     : College_Classroom_WiFi
+    All User Profile     : Home_Network
+";
+        let networks = "
+Interface name : Wi-Fi 
+There are 2 networks currently visible. 
+
+SSID 1 : College_Classroom_WiFi
+    Network type            : Infrastructure
+SSID 2 : Random_Cafe
+    Network type            : Infrastructure
+";
+        // When at college, Campus_Hostel_Net is out of range, so College_Classroom_WiFi must be chosen!
+        let found = find_preferred_wlan_profile_in_range(profiles, Some(networks));
+        assert_eq!(found, Some("College_Classroom_WiFi".to_string()));
     }
 }

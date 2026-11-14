@@ -2,6 +2,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{CACHE_CONTROL, CONNECTION, PRAGMA, USER_AGENT};
 use reqwest::redirect::Policy;
 use std::net::{IpAddr, Ipv4Addr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 /// Canonical Firefox endpoint returning "success\n" (HTTP 200) when unlocked
@@ -9,8 +10,31 @@ pub const FIREFOX_SUCCESS_URL: &str = "http://detectportal.firefox.com/success.t
 pub const FIREFOX_EXPECTED_BODY: &str = "success";
 /// Fallback Google connectivity check endpoint returning HTTP 204 No Content when unlocked
 pub const GSTATIC_204_URL: &str = "http://connectivitycheck.gstatic.com/generate_204";
-/// Fallback IPv4-literal probe if campus DNS drops external queries before auth
-pub const RAW_IP_FALLBACK_URL: &str = "http://1.1.1.1/";
+/// Official Microsoft NCSI connectivity check endpoint returning "Microsoft Connect Test"
+pub const MSFT_CONNECTTEST_URL: &str = "http://www.msftconnecttest.com/connecttest.txt";
+pub const MSFT_EXPECTED_BODY: &str = "Microsoft Connect Test";
+
+static META_REFRESH_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)<meta[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*url\s*=\s*["']?([^"'\s>]+)"#,
+    )
+    .unwrap()
+});
+
+static FORM_ACTION_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"(?i)<form[^>]*action\s*=\s*["']([^"']+)["']"#).unwrap());
+
+static JS_REDIRECT_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?i)(?:window\.|document\.|self\.|top\.)?location(?:\.href|\s*\.\s*replace|\s*\.\s*assign)?\s*(?:=|\()\s*["']([^"']+)["']"#).unwrap()
+});
+
+static GENERAL_URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"https?://[a-zA-Z0-9.-]+(?::[0-9]+)?(?:/[^\s"'<>`\\]*)?"#).unwrap()
+});
+
+static XML_MESSAGE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?is)<message>(?:\s*<!\[CDATA\[)?(.*?)(?:\]\]>\s*)?</message>"#).unwrap()
+});
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeResult {
@@ -64,11 +88,34 @@ pub fn is_gateway_reachable(gateway: &str) -> bool {
         let port = parsed
             .port()
             .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+
+        // 1. Direct IP check fast-path (no DNS lookup)
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if let IpAddr::V4(gw_ipv4) = ip
+                && let Some(local_ip) = current_local_ipv4()
+                && !gw_ipv4.is_loopback()
+                && !local_ip.is_loopback()
+            {
+                // Require same /16 prefix so a cached gateway from a different subnet is never used
+                if gw_ipv4.octets()[0..2] != local_ip.octets()[0..2] {
+                    return false;
+                }
+            }
+
+            let sock_addr = std::net::SocketAddr::new(ip, port);
+            return TcpStream::connect_timeout(&sock_addr, Duration::from_millis(400)).is_ok();
+        }
+
+        // 2. Hostname resolution with IPv4 preference
         let addr_str = format!("{}:{}", host, port);
-        if let Ok(mut addrs) = addr_str.to_socket_addrs()
-            && let Some(addr) = addrs.next()
-        {
-            return TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok();
+        if let Ok(addrs) = addr_str.to_socket_addrs() {
+            let mut sorted_addrs: Vec<std::net::SocketAddr> = addrs.collect();
+            sorted_addrs.sort_by_key(|sa| if sa.is_ipv4() { 0 } else { 1 });
+            for addr in sorted_addrs {
+                if TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok() {
+                    return true;
+                }
+            }
         }
     }
     false
@@ -94,12 +141,28 @@ pub fn build_fast_client(follow_redirects: bool) -> Result<Client, reqwest::Erro
 
 fn is_ignored_host(host: &str) -> bool {
     let h = host.to_lowercase();
-    h == "detectportal.firefox.com"
-        || h == "1.1.1.1"
-        || h == "connectivitycheck.gstatic.com"
-        || h == "clients3.google.com"
-        || h == "msftconnecttest.com"
-        || h == "example.com"
+    let ignored = [
+        "detectportal.firefox.com",
+        "1.1.1.1",
+        "connectivitycheck.gstatic.com",
+        "clients3.google.com",
+        "msftconnecttest.com",
+        "www.msftconnecttest.com",
+        "msftncsi.com",
+        "example.com",
+        "w3.org",
+        "www.w3.org",
+        "one.one.one.one",
+        "cloudflare.com",
+        "mozilla.org",
+        "firefox.com",
+        "google.com",
+        "apple.com",
+        "microsoft.com",
+    ];
+    ignored
+        .iter()
+        .any(|&ig| h == ig || h.ends_with(&format!(".{ig}")))
 }
 
 fn is_private_or_local_ip(host: &str) -> bool {
@@ -112,6 +175,48 @@ fn is_private_or_local_ip(host: &str) -> bool {
     } else {
         false
     }
+}
+
+fn is_valid_portal_target(parsed: &url::Url, raw_context: &str) -> bool {
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if is_ignored_host(host) {
+        return false;
+    }
+
+    let port = parsed.port();
+    if port == Some(8090)
+        || port == Some(6082)
+        || raw_context.contains(":8090")
+        || raw_context.contains(":6082")
+        || raw_context.contains("httpclient")
+        || raw_context.contains("uid.php")
+        || raw_context.contains("login.xml")
+        || raw_context.contains("fgtauth")
+    {
+        return true;
+    }
+
+    if host == "localhost" || is_private_or_local_ip(host) {
+        return true;
+    }
+
+    let addr_str = format!("{}:{}", host, port.unwrap_or(80));
+    if let Ok(mut addrs) = addr_str.to_socket_addrs() {
+        return addrs.any(|sa| match sa.ip() {
+            IpAddr::V4(ipv4) => {
+                let octets = ipv4.octets();
+                octets[0] == 10
+                    || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                    || (octets[0] == 192 && octets[1] == 168)
+                    || ipv4.is_loopback()
+            }
+            IpAddr::V6(ipv6) => ipv6.is_loopback(),
+        });
+    }
+
+    false
 }
 
 fn format_gateway_base(scheme: &str, host: &str, port: Option<u16>, full_context: &str) -> String {
@@ -148,63 +253,68 @@ pub fn resolve_login_target(raw_redirect_or_html: &str) -> Option<(String, Strin
     // 1. Direct URL parse attempt
     if let Ok(parsed) = url::Url::parse(text)
         && (parsed.scheme() == "http" || parsed.scheme() == "https")
-        && let Some(host) = parsed.host_str()
-        && !is_ignored_host(host)
+        && is_valid_portal_target(&parsed, text)
     {
         return Some(determine_login_target(&parsed, text));
     }
 
-    // 2. Scan for URLs within HTML / JS / text
-    if let Ok(re) = regex::Regex::new(r#"https?://[a-zA-Z0-9.-]+(?::[0-9]+)?(?:/[^\s"'<>`\\]*)?"#) {
-        let mut candidates = Vec::new();
-        for m in re.find_iter(text) {
-            let raw_url = m
-                .as_str()
-                .trim_end_matches(&[')', ']', ';', ',', '\'', '"', '\\'][..]);
-            if let Ok(parsed) = url::Url::parse(raw_url) {
-                if parsed.scheme() != "http" && parsed.scheme() != "https" {
-                    continue;
-                }
-                if let Some(host) = parsed.host_str() {
-                    if is_ignored_host(host) {
-                        continue;
-                    }
+    // 2. Scan for URLs inside HTML redirect/form constructs
+    let mut candidates = Vec::new();
 
-                    let mut score = 0i32;
-                    if parsed.port() == Some(8090) || raw_url.contains(":8090") {
-                        score += 100;
-                    }
-                    if raw_url.contains("httpclient") {
-                        score += 50;
-                    }
-                    if raw_url.contains("login.xml")
-                        || raw_url.contains("/php/")
-                        || raw_url.contains("uid.php")
-                    {
-                        score += 50;
-                    }
-                    if is_private_or_local_ip(host) {
-                        score += 30;
-                    }
-                    candidates.push((score, parsed, raw_url.to_string()));
-                }
-            }
+    for caps in META_REFRESH_RE.captures_iter(text) {
+        if let Some(m) = caps.get(1) {
+            candidates.push((120, m.as_str().to_string()));
         }
+    }
 
-        candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
-        if let Some((_, best, raw)) = candidates.into_iter().next()
-            && best.host_str().is_some()
+    for caps in FORM_ACTION_RE.captures_iter(text) {
+        if let Some(m) = caps.get(1) {
+            candidates.push((110, m.as_str().to_string()));
+        }
+    }
+
+    for caps in JS_REDIRECT_RE.captures_iter(text) {
+        if let Some(m) = caps.get(1) {
+            candidates.push((110, m.as_str().to_string()));
+        }
+    }
+
+    for m in GENERAL_URL_RE.find_iter(text) {
+        let raw_url = m
+            .as_str()
+            .trim_end_matches(&[')', ']', ';', ',', '\'', '"', '\\'][..]);
+        if raw_url.contains(":8090")
+            || raw_url.contains("httpclient")
+            || raw_url.contains("login.xml")
+            || raw_url.contains("/php/uid.php")
+            || raw_url.contains("fgtauth")
         {
-            return Some(determine_login_target(&best, &raw));
+            candidates.push((100, raw_url.to_string()));
+        }
+    }
+
+    candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
+
+    for (_, raw_cand) in candidates {
+        let normalized = if raw_cand.starts_with("http://") || raw_cand.starts_with("https://") {
+            raw_cand
+        } else {
+            format!("http://{}", raw_cand.trim_start_matches('/'))
+        };
+
+        if let Ok(parsed) = url::Url::parse(&normalized)
+            && (parsed.scheme() == "http" || parsed.scheme() == "https")
+            && is_valid_portal_target(&parsed, text)
+        {
+            return Some(determine_login_target(&parsed, &normalized));
         }
     }
 
     // 3. Fallback: Host[:port] without scheme (e.g. "172.16.68.6:8090" or "10.1.1.9:8090/login")
     let with_scheme = format!("http://{}", text);
     if let Ok(parsed) = url::Url::parse(&with_scheme)
-        && let Some(host) = parsed.host_str()
-        && !is_ignored_host(host)
-        && (is_private_or_local_ip(host) || parsed.port().is_some() || text.contains(":8090"))
+        && (parsed.scheme() == "http" || parsed.scheme() == "https")
+        && is_valid_portal_target(&parsed, text)
     {
         return Some(determine_login_target(&parsed, &with_scheme));
     }
@@ -219,16 +329,18 @@ fn determine_login_target(parsed: &url::Url, raw_str: &str) -> (String, String) 
     let gateway_base = format_gateway_base(scheme, host, port, raw_str);
 
     let path = parsed.path();
-    let query = parsed.query();
-    let has_non_root_path_or_query = (path != "/" && !path.is_empty()) || query.is_some();
-    let ends_with_httpclient = path.ends_with("/httpclient.html") || path == "httpclient.html";
+    let is_sophos_landing = parsed.port() == Some(8090)
+        || raw_str.contains(":8090")
+        || path.ends_with("/httpclient.html")
+        || path == "httpclient.html"
+        || path.ends_with("/login.xml");
 
-    let login_url = if has_non_root_path_or_query && !ends_with_httpclient {
-        // Keep exact full redirect URL (e.g. Palo Alto /php/uid.php?vsys=1...)
-        raw_str.to_string()
-    } else {
-        // Sophos / Cyberoam / default
+    let login_url = if is_sophos_landing {
         format!("{}/login.xml", gateway_base.trim_end_matches('/'))
+    } else {
+        // For ALL non-Sophos portals (including root path http://172.16.1.1/ or /php/uid.php?...),
+        // preserve the exact full redirect URL
+        raw_str.to_string()
     };
 
     (gateway_base, login_url)
@@ -258,9 +370,11 @@ fn resolve_fallback_gateway(fallback_gateway: Option<&str>, err_context: &str) -
     ProbeResult::ProbeTimeoutOrError(err_context.to_string())
 }
 
-/// Probes a specific URL using the Firefox CaptiveDetect algorithm with GStatic fallback
-pub fn probe_url(client: &Client, url: &str, fallback_gateway: Option<&str>) -> ProbeResult {
-    let req = client
+fn send_probe_request(
+    client: &Client,
+    url: &str,
+) -> Result<reqwest::blocking::Response, reqwest::Error> {
+    client
         .get(url)
         .header(CACHE_CONTROL, "no-cache")
         .header(PRAGMA, "no-cache")
@@ -268,44 +382,43 @@ pub fn probe_url(client: &Client, url: &str, fallback_gateway: Option<&str>) -> 
         .header(
             USER_AGENT,
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
-        );
+        )
+        .send()
+}
 
-    match req.send() {
+/// Probes a specific URL using the Firefox CaptiveDetect algorithm with GStatic and MSFT fallbacks
+pub fn probe_url(client: &Client, url: &str, fallback_gateway: Option<&str>) -> ProbeResult {
+    let res = send_probe_request(client, url);
+    let probe_result = match res {
         Ok(resp) => parse_probe_response(resp, fallback_gateway),
-        Err(primary_err) => {
-            if url == FIREFOX_SUCCESS_URL {
-                // 1. Try connectivitycheck.gstatic.com/generate_204 (from original main:src/main.rs line 61)
-                let gstatic_req = client
-                    .get(GSTATIC_204_URL)
-                    .header(CACHE_CONTROL, "no-cache")
-                    .header(PRAGMA, "no-cache")
-                    .header(CONNECTION, "close")
-                    .header(
-                        USER_AGENT,
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
-                    );
-                if let Ok(resp) = gstatic_req.send() {
-                    return parse_probe_response(resp, fallback_gateway);
-                }
+        Err(primary_err) => ProbeResult::ProbeTimeoutOrError(primary_err.to_string()),
+    };
 
-                // 2. Try raw IP 1.1.1.1 with Host: detectportal.firefox.com
-                let fb_req = client
-                    .get(RAW_IP_FALLBACK_URL)
-                    .header(reqwest::header::HOST, "detectportal.firefox.com")
-                    .header(CACHE_CONTROL, "no-cache")
-                    .header(PRAGMA, "no-cache")
-                    .header(CONNECTION, "close")
-                    .header(
-                        USER_AGENT,
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
-                    );
-                if let Ok(resp) = fb_req.send() {
-                    return parse_probe_response(resp, fallback_gateway);
-                }
+    // When url == FIREFOX_SUCCESS_URL, if req.send() fails OR if parse_probe_response returns
+    // ProbeResult::ProbeTimeoutOrError(_) (e.g. unrecognized 403/502 response without a redirect),
+    // automatically try GSTATIC_204_URL and then MSFT_CONNECTTEST_URL before fallback_gateway!
+    if url == FIREFOX_SUCCESS_URL && matches!(probe_result, ProbeResult::ProbeTimeoutOrError(_)) {
+        // 1. Try GSTATIC_204_URL
+        if let Ok(resp) = send_probe_request(client, GSTATIC_204_URL) {
+            let res2 = parse_probe_response(resp, fallback_gateway);
+            if !matches!(res2, ProbeResult::ProbeTimeoutOrError(_)) {
+                return res2;
             }
-
-            resolve_fallback_gateway(fallback_gateway, &primary_err.to_string())
         }
+
+        // 2. Try MSFT_CONNECTTEST_URL
+        if let Ok(resp) = send_probe_request(client, MSFT_CONNECTTEST_URL) {
+            let res3 = parse_probe_response(resp, fallback_gateway);
+            if !matches!(res3, ProbeResult::ProbeTimeoutOrError(_)) {
+                return res3;
+            }
+        }
+    }
+
+    if let ProbeResult::ProbeTimeoutOrError(err_msg) = probe_result {
+        resolve_fallback_gateway(fallback_gateway, &err_msg)
+    } else {
+        probe_result
     }
 }
 
@@ -322,7 +435,8 @@ fn parse_probe_response(
 
     if status.is_success() {
         let body = resp.text().unwrap_or_default();
-        if body.trim() == FIREFOX_EXPECTED_BODY {
+        let trimmed = body.trim();
+        if trimmed == FIREFOX_EXPECTED_BODY || trimmed == MSFT_EXPECTED_BODY {
             return ProbeResult::OnlineUnlocked;
         }
 
@@ -335,12 +449,21 @@ fn parse_probe_response(
     } else if status.is_redirection() || status.as_u16() == 511 {
         if let Some(loc) = resp.headers().get(reqwest::header::LOCATION)
             && let Ok(loc_str) = loc.to_str()
-            && let Some((gateway_base, login_xml_url)) = resolve_login_target(loc_str)
         {
-            return ProbeResult::LockedPortal {
-                gateway_base,
-                login_xml_url,
+            let full_loc = if let Ok(u) = url::Url::parse(loc_str) {
+                u.to_string()
+            } else if let Ok(joined) = resp.url().join(loc_str) {
+                joined.to_string()
+            } else {
+                loc_str.to_string()
             };
+
+            if let Some((gateway_base, login_xml_url)) = resolve_login_target(&full_loc) {
+                return ProbeResult::LockedPortal {
+                    gateway_base,
+                    login_xml_url,
+                };
+            }
         }
         let body = resp.text().unwrap_or_default();
         if let Some((gateway_base, login_xml_url)) = resolve_login_target(&body) {
@@ -370,9 +493,7 @@ pub fn probe_network(client: &Client, fallback_gateway: Option<&str>) -> ProbeRe
 
 /// Extracts the message text inside <message><![CDATA[...]]></message> or <message>...</message>
 pub fn extract_xml_message(body: &str) -> Option<String> {
-    let re = regex::Regex::new(r#"(?is)<message>(?:\s*<!\[CDATA\[)?(.*?)(?:\]\]>\s*)?</message>"#)
-        .ok()?;
-    if let Some(caps) = re.captures(body)
+    if let Some(caps) = XML_MESSAGE_RE.captures(body)
         && let Some(m) = caps.get(1)
     {
         let msg = m.as_str().trim();
@@ -389,20 +510,20 @@ pub fn validate_portal_response(status_code: u16, body: &str) -> Result<String, 
     let body_lower = body.to_lowercase();
     let extracted_msg = extract_xml_message(body);
 
-    let has_success_keyword = body_lower.contains("<status>live</status>")
-        || body_lower.contains("[cdata[live]]")
-        || body_lower.contains("signed in")
-        || body_lower.contains("successfully logged in");
-
-    // 1. Explicit failure checks
-    if let Some(msg) = &extracted_msg
-        && !has_success_keyword
+    // 1. Explicit XML status failure checks
+    if body_lower.contains("<status>fail</status>")
+        || body_lower.contains("[cdata[fail]]")
+        || body_lower.contains("<status>login</status>")
+        || body_lower.contains("[cdata[login]]")
     {
+        let msg = extracted_msg.unwrap_or_else(|| "Portal returned FAIL status".to_string());
         return Err(format!("Portal rejected login: {}", msg));
     }
 
+    // 2. Failure keywords check (checked BEFORE success keywords)
     let failure_keywords = [
         "invalid username",
+        "invalid user name",
         "invalid password",
         "incorrect password",
         "authentication failed",
@@ -413,21 +534,38 @@ pub fn validate_portal_response(status_code: u16, body: &str) -> Result<String, 
         "make sure your password is correct",
         "account expired",
         "access denied",
+        "not signed in",
+        "keep me signed in",
+        "stay signed in",
+        "sign in to",
     ];
 
     for keyword in &failure_keywords {
         if body_lower.contains(keyword) {
-            return Err(format!("Portal rejected login: {}", keyword));
+            let msg = extracted_msg.unwrap_or_else(|| keyword.to_string());
+            return Err(format!("Portal rejected login: {}", msg));
         }
     }
 
-    // 2. Explicit Sophos/text success
+    let has_success_keyword = body_lower.contains("<status>live</status>")
+        || body_lower.contains("[cdata[live]]")
+        || body_lower.contains("you are signed in")
+        || body_lower.contains("successfully logged in");
+
+    // If XML message exists but body does not contain success keyword, treat as error
+    if let Some(msg) = &extracted_msg
+        && !has_success_keyword
+    {
+        return Err(format!("Portal rejected login: {}", msg));
+    }
+
+    // 3. Success keyword check
     if has_success_keyword {
         return Ok(extracted_msg.unwrap_or_else(|| "Authentication successful".to_string()));
     }
 
-    // 3. Fallback matching main:src/main.rs (HTTP 200 | 301 | 302 | 303 without failure keywords)
-    let is_sophos_xml = body.contains("<requestresponse>") || body.contains("<status>");
+    // 4. Fallback matching main:src/main.rs (HTTP 200 | 301 | 302 | 303 for non-Sophos HTML portals)
+    let is_sophos_xml = body_lower.contains("<requestresponse>") || body_lower.contains("<status>");
     if !is_sophos_xml && matches!(status_code, 200 | 301 | 302 | 303) {
         return Ok("Login request completed.".to_string());
     }
@@ -499,7 +637,7 @@ pub fn submit_login_post(
     }
 }
 
-/// Authenticates to the captive portal with auto-retry between http and https,
+/// Authenticates to the captive portal with auto-retry to HTTPS if initial HTTP fails,
 /// and validates the portal response body and status code.
 pub fn post_login(
     client: &Client,
@@ -513,16 +651,17 @@ pub fn post_login(
     let resp = match result {
         Ok(r) => r,
         Err(e) => {
-            // HTTPS vs. HTTP auto-retry:
-            let alt_url = if login_xml_url.starts_with("http://") {
-                login_xml_url.replacen("http://", "https://", 1)
-            } else if login_xml_url.starts_with("https://") {
-                login_xml_url.replacen("https://", "http://", 1)
+            // HTTPS upgrade retry only for http:// (never downgrade https:// to http://)
+            if login_xml_url.starts_with("http://") {
+                let https_url = login_xml_url.replacen("http://", "https://", 1);
+                println!(
+                    "Initial POST failed ({}), retrying with HTTPS: {}",
+                    e, https_url
+                );
+                submit_login_post(client, &https_url, username, password)?
             } else {
                 return Err(Box::new(e));
-            };
-            println!("Initial POST failed ({}), retrying with: {}", e, alt_url);
-            submit_login_post(client, &alt_url, username, password)?
+            }
         }
     };
 
@@ -548,6 +687,50 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    pub fn read_full_http_request(stream: &mut TcpStream) -> String {
+        let _ = stream.set_nodelay(true);
+        let mut data = Vec::new();
+        let mut buf = [0u8; 1024];
+        let mut content_length: Option<usize> = None;
+        let mut header_len: Option<usize> = None;
+
+        loop {
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..n]);
+
+            if header_len.is_none()
+                && let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n")
+            {
+                let h_end = pos + 4;
+                header_len = Some(h_end);
+                let header_str = String::from_utf8_lossy(&data[..h_end]);
+                for line in header_str.lines() {
+                    if let Some(idx) = line.find(':') {
+                        let key = line[..idx].trim().to_lowercase();
+                        if key == "content-length" {
+                            content_length = line[idx + 1..].trim().parse::<usize>().ok();
+                        }
+                    }
+                }
+            }
+
+            if let Some(h_end) = header_len {
+                let required_total = h_end + content_length.unwrap_or(0);
+                if data.len() >= required_total {
+                    break;
+                }
+            }
+        }
+
+        String::from_utf8_lossy(&data).to_string()
+    }
 
     fn spawn_mock_server(raw_response: &'static str) -> (String, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock listener");
@@ -555,8 +738,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/probe");
         let handle = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 2048];
-                let _ = stream.read(&mut buf);
+                let _ = read_full_http_request(&mut stream);
                 let _ = stream.write_all(raw_response.as_bytes());
                 let _ = stream.flush();
             }
@@ -658,6 +840,38 @@ mod tests {
                 "http://172.16.68.6:8090/login.xml".to_string()
             ))
         );
+
+        // Non-Sophos root path: preserves "http://172.16.1.1/"
+        let root_path = "http://172.16.1.1/";
+        let root_result = resolve_login_target(root_path);
+        assert_eq!(
+            root_result,
+            Some((
+                "http://172.16.1.1".to_string(),
+                "http://172.16.1.1/".to_string()
+            ))
+        );
+
+        // Sophos port 8090 non-httpclient path resolves to /login.xml
+        let sophos_non_client = "http://172.16.68.6:8090/index.html";
+        let sophos_non_client_res = resolve_login_target(sophos_non_client);
+        assert_eq!(
+            sophos_non_client_res,
+            Some((
+                "http://172.16.68.6:8090".to_string(),
+                "http://172.16.68.6:8090/login.xml".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_resolve_login_target_rejects_w3_doctype() {
+        let html_with_doctype = r#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Test</title></head>
+<body>Hello world</body>
+</html>"#;
+        assert_eq!(resolve_login_target(html_with_doctype), None);
     }
 
     #[test]
@@ -707,9 +921,24 @@ mod tests {
 
     #[test]
     fn test_validate_sophos_response_signed_in() {
-        let body = "<html><body>You are signed in to the captive network.</body></html>";
+        let body = "<html><body>You are signed in as testuser</body></html>";
         let res = validate_sophos_response(body);
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_validate_portal_response_signed_in_false_positives() {
+        // "You are not signed in" must be rejected
+        let body1 = "<html><body>You are not signed in. Please log in.</body></html>";
+        assert!(validate_sophos_response(body1).is_err());
+
+        // "Keep me signed in" must be rejected
+        let body2 = "<form><input type='checkbox'>Keep me signed in</form>";
+        assert!(validate_sophos_response(body2).is_err());
+
+        // "Stay signed in" must be rejected
+        let body3 = "<html><body>Stay signed in to this network</body></html>";
+        assert!(validate_sophos_response(body3).is_err());
     }
 
     #[test]
@@ -770,6 +999,7 @@ mod tests {
 
     #[test]
     fn test_ccp_probe_url_env_override() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         let override_val = "http://127.0.0.1:9999/test-probe";
         unsafe {
             std::env::set_var("CCP_PROBE_URL", override_val);
@@ -789,9 +1019,7 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 2048];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]);
+                let request = read_full_http_request(&mut stream);
 
                 // Verify the form payload encodes special characters like & and =
                 assert!(
@@ -820,9 +1048,7 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 2048];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]);
+                let request = read_full_http_request(&mut stream);
 
                 // Verify exact 6 params from main:src/main.rs (without mode=191)
                 assert!(

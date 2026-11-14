@@ -21,8 +21,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let password = rpassword::prompt_password("Password: ")?;
 
         if username.is_empty() || password.is_empty() {
-            println!("Username and password cannot be empty.");
-            return Ok(());
+            eprintln!("Username and password cannot be empty.");
+            return Err("Username and password cannot be empty.".into());
         }
 
         let mut file = create_credentials_file()?;
@@ -40,8 +40,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let path = credentials_path();
 
         if !Path::new(&path).exists() {
-            println!("Credentials not found. Run `ccp set` first.");
-            return Ok(());
+            eprintln!("Credentials not found. Run `ccp set` first.");
+            return Err("Credentials not found. Run `ccp set` first.".into());
         }
 
         let mut file = File::open(&path)?;
@@ -53,8 +53,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let password = lines.next().unwrap_or("").trim();
 
         if username.is_empty() || password.is_empty() {
-            println!("Username or password missing in credentials file.");
-            return Ok(());
+            eprintln!("Username or password missing in credentials file.");
+            return Err("Username or password missing in credentials file.".into());
         }
 
         let cached_gateway = get_cached_gateway();
@@ -74,8 +74,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 login_xml_url,
             } => {
                 println!("Portal detected at: {}", gateway_base);
-                set_cached_gateway(&login_xml_url);
                 probe::post_login(&client, &login_xml_url, username, password)?;
+                set_cached_gateway(&login_xml_url);
                 return Ok(());
             }
 
@@ -95,42 +95,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match post_connect_probe {
                             ProbeResult::OnlineUnlocked => {
                                 println!("Already connected and authenticated!");
+                                return Ok(());
                             }
                             ProbeResult::LockedPortal {
                                 gateway_base,
                                 login_xml_url,
                             } => {
                                 println!("Portal detected at: {}", gateway_base);
-                                set_cached_gateway(&login_xml_url);
                                 probe::post_login(&client, &login_xml_url, username, password)?;
+                                set_cached_gateway(&login_xml_url);
+                                return Ok(());
                             }
                             ProbeResult::InterfaceOffline => {
-                                println!("Interface still offline after Wi-Fi connect attempt.");
+                                eprintln!("Interface still offline after Wi-Fi connect attempt.");
+                                return Err(
+                                    "Interface still offline after Wi-Fi connect attempt.".into()
+                                );
                             }
                             ProbeResult::ProbeTimeoutOrError(e) => {
                                 eprintln!("Probe failed after Wi-Fi connect: {}", e);
+                                return Err(e.into());
                             }
                         }
                     }
                     None => {
-                        println!(" Timed out waiting for IPv4 route.");
+                        eprintln!(" Timed out waiting for IPv4 route.");
+                        return Err("Timed out waiting for IPv4 route.".into());
                     }
                 }
-                return Ok(());
             }
 
             ProbeResult::ProbeTimeoutOrError(err_msg) => {
                 eprintln!("Network probe error: {}", err_msg);
-                return Ok(());
+                return Err(err_msg.into());
             }
         }
     }
 
-    println!("Usage:");
-    println!("  ccp       Authenticate using saved credentials");
-    println!("  ccp set   Save username and password");
+    eprintln!("Usage:");
+    eprintln!("  ccp       Authenticate using saved credentials");
+    eprintln!("  ccp set   Save username and password");
 
-    Ok(())
+    Err("Invalid command line arguments.".into())
 }
 
 fn credentials_path() -> PathBuf {
@@ -231,5 +237,19 @@ fn create_credentials_file() -> std::io::Result<File> {
         fs::create_dir_all(parent)?;
     }
 
-    File::create(path)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        File::create(path)
+    }
 }

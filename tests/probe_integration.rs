@@ -1,6 +1,47 @@
 use ccp::probe::{ProbeResult, build_fast_client, extract_gateway_base, post_login, probe_url};
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
+
+fn read_full_http_request(stream: &mut TcpStream) -> String {
+    let _ = stream.set_nodelay(true);
+    let mut data = Vec::new();
+    let mut buf = [0u8; 1024];
+    let mut content_length: Option<usize> = None;
+    let mut header_len: Option<usize> = None;
+
+    loop {
+        let n = stream.read(&mut buf).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n]);
+
+        if header_len.is_none()
+            && let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n")
+        {
+            let h_end = pos + 4;
+            header_len = Some(h_end);
+            let header_str = String::from_utf8_lossy(&data[..h_end]);
+            for line in header_str.lines() {
+                if let Some(idx) = line.find(':') {
+                    let key = line[..idx].trim().to_lowercase();
+                    if key == "content-length" {
+                        content_length = line[idx + 1..].trim().parse::<usize>().ok();
+                    }
+                }
+            }
+        }
+
+        if let Some(h_end) = header_len {
+            let required_total = h_end + content_length.unwrap_or(0);
+            if data.len() >= required_total {
+                break;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&data).to_string()
+}
 
 fn spawn_mock_server(raw_response: &'static str) -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock listener");
@@ -8,8 +49,7 @@ fn spawn_mock_server(raw_response: &'static str) -> (String, std::thread::JoinHa
     let url = format!("http://127.0.0.1:{port}/probe");
     let handle = std::thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 1024];
-            let _ = stream.read(&mut buf);
+            let _ = read_full_http_request(&mut stream);
             let _ = stream.write_all(raw_response.as_bytes());
             let _ = stream.flush();
         }
@@ -82,8 +122,7 @@ fn test_e2e_firefox_redirect_to_sophos_login_xml() {
     let handle = std::thread::spawn(move || {
         // Step 1: Intercept probe with 302 Found redirect
         if let Ok((mut stream1, _)) = listener.accept() {
-            let mut buf = [0u8; 2048];
-            let _ = stream1.read(&mut buf);
+            let _ = read_full_http_request(&mut stream1);
             let redirect_response = format!(
                 "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/httpclient.html?u=http://detectportal.firefox.com/success.txt\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );
@@ -93,9 +132,7 @@ fn test_e2e_firefox_redirect_to_sophos_login_xml() {
 
         // Step 2: Accept POST /login.xml with special chars in password and return LIVE XML
         if let Ok((mut stream2, _)) = listener.accept() {
-            let mut buf = [0u8; 4096];
-            let n = stream2.read(&mut buf).unwrap_or(0);
-            let req_str = String::from_utf8_lossy(&buf[..n]);
+            let req_str = read_full_http_request(&mut stream2);
 
             // Assert that password with & and = was properly URL-encoded
             assert!(
