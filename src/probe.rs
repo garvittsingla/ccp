@@ -79,6 +79,41 @@ pub fn current_local_ipv4() -> Option<Ipv4Addr> {
     }
 }
 
+fn is_compatible_gateway_subnet(
+    gw_ipv4: Ipv4Addr,
+    local_ip: Ipv4Addr,
+    port: u16,
+    path: &str,
+) -> bool {
+    if gw_ipv4.is_loopback() || local_ip.is_loopback() {
+        return true;
+    }
+
+    let gw_oct = gw_ipv4.octets();
+    let loc_oct = local_ip.octets();
+
+    let is_10 = gw_oct[0] == 10 && loc_oct[0] == 10;
+    let is_172 = gw_oct[0] == 172
+        && (16..=31).contains(&gw_oct[1])
+        && loc_oct[0] == 172
+        && (16..=31).contains(&loc_oct[1]);
+    let is_192 = gw_oct[0..3] == loc_oct[0..3] && gw_oct[0..2] == [192, 168];
+
+    if !(is_10 || is_172 || is_192) {
+        return false;
+    }
+
+    if gw_oct[0..2] == [192, 168] {
+        let has_portal_port = port == 8090 || port == 6082;
+        let has_portal_path = path != "/" && !path.is_empty();
+        if !has_portal_port && !has_portal_path {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Checks if a gateway host:port is reachable via a fast 400ms TCP connection check
 pub fn is_gateway_reachable(gateway: &str) -> bool {
     let normalized = normalize_gateway_base(gateway);
@@ -93,13 +128,9 @@ pub fn is_gateway_reachable(gateway: &str) -> bool {
         if let Ok(ip) = host.parse::<IpAddr>() {
             if let IpAddr::V4(gw_ipv4) = ip
                 && let Some(local_ip) = current_local_ipv4()
-                && !gw_ipv4.is_loopback()
-                && !local_ip.is_loopback()
+                && !is_compatible_gateway_subnet(gw_ipv4, local_ip, port, parsed.path())
             {
-                // Require same /16 prefix so a cached gateway from a different subnet is never used
-                if gw_ipv4.octets()[0..2] != local_ip.octets()[0..2] {
-                    return false;
-                }
+                return false;
             }
 
             let sock_addr = std::net::SocketAddr::new(ip, port);
@@ -112,6 +143,13 @@ pub fn is_gateway_reachable(gateway: &str) -> bool {
             let mut sorted_addrs: Vec<std::net::SocketAddr> = addrs.collect();
             sorted_addrs.sort_by_key(|sa| if sa.is_ipv4() { 0 } else { 1 });
             for addr in sorted_addrs {
+                if let IpAddr::V4(gw_ipv4) = addr.ip()
+                    && let Some(local_ip) = current_local_ipv4()
+                    && !is_compatible_gateway_subnet(gw_ipv4, local_ip, port, parsed.path())
+                {
+                    continue;
+                }
+
                 if TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok() {
                     return true;
                 }
@@ -177,7 +215,7 @@ fn is_private_or_local_ip(host: &str) -> bool {
     }
 }
 
-fn is_valid_portal_target(parsed: &url::Url, raw_context: &str) -> bool {
+fn is_valid_portal_target(parsed: &url::Url) -> bool {
     let Some(host) = parsed.host_str() else {
         return false;
     };
@@ -185,24 +223,26 @@ fn is_valid_portal_target(parsed: &url::Url, raw_context: &str) -> bool {
         return false;
     }
 
-    let port = parsed.port();
-    if port == Some(8090)
-        || port == Some(6082)
-        || raw_context.contains(":8090")
-        || raw_context.contains(":6082")
-        || raw_context.contains("httpclient")
-        || raw_context.contains("uid.php")
-        || raw_context.contains("login.xml")
-        || raw_context.contains("fgtauth")
+    let h_lower = host.to_lowercase();
+    if h_lower.ends_with(".xml")
+        || h_lower.ends_with(".html")
+        || h_lower.ends_with(".htm")
+        || h_lower.ends_with(".php")
+        || h_lower.ends_with(".jsp")
+        || h_lower.ends_with(".asp")
+        || h_lower.ends_with(".cgi")
     {
-        return true;
+        return false;
     }
 
     if host == "localhost" || is_private_or_local_ip(host) {
         return true;
     }
 
-    let addr_str = format!("{}:{}", host, port.unwrap_or(80));
+    let port = parsed
+        .port()
+        .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+    let addr_str = format!("{}:{}", host, port);
     if let Ok(mut addrs) = addr_str.to_socket_addrs() {
         return addrs.any(|sa| match sa.ip() {
             IpAddr::V4(ipv4) => {
@@ -253,7 +293,7 @@ pub fn resolve_login_target(raw_redirect_or_html: &str) -> Option<(String, Strin
     // 1. Direct URL parse attempt
     if let Ok(parsed) = url::Url::parse(text)
         && (parsed.scheme() == "http" || parsed.scheme() == "https")
-        && is_valid_portal_target(&parsed, text)
+        && is_valid_portal_target(&parsed)
     {
         return Some(determine_login_target(&parsed, text));
     }
@@ -296,31 +336,41 @@ pub fn resolve_login_target(raw_redirect_or_html: &str) -> Option<(String, Strin
     candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
 
     for (_, raw_cand) in candidates {
-        if raw_cand.starts_with('/') {
-            continue;
-        }
-
         let normalized = if raw_cand.starts_with("http://") || raw_cand.starts_with("https://") {
             raw_cand
         } else {
-            format!("http://{}", raw_cand)
+            if raw_cand.starts_with('/') {
+                continue;
+            }
+            let host_part = raw_cand
+                .split(&['/', ':', '?', '#'][..])
+                .next()
+                .unwrap_or("");
+            if host_part == "localhost" || host_part.parse::<Ipv4Addr>().is_ok() {
+                format!("http://{}", raw_cand)
+            } else {
+                continue;
+            }
         };
 
         if let Ok(parsed) = url::Url::parse(&normalized)
             && (parsed.scheme() == "http" || parsed.scheme() == "https")
-            && is_valid_portal_target(&parsed, text)
+            && is_valid_portal_target(&parsed)
         {
             return Some(determine_login_target(&parsed, &normalized));
         }
     }
 
     // 3. Fallback: Host[:port] without scheme (e.g. "172.16.68.6:8090" or "10.1.1.9:8090/login")
-    let with_scheme = format!("http://{}", text);
-    if let Ok(parsed) = url::Url::parse(&with_scheme)
-        && (parsed.scheme() == "http" || parsed.scheme() == "https")
-        && is_valid_portal_target(&parsed, text)
-    {
-        return Some(determine_login_target(&parsed, &with_scheme));
+    let host_part = text.split(&['/', ':', '?', '#'][..]).next().unwrap_or("");
+    if host_part == "localhost" || host_part.parse::<Ipv4Addr>().is_ok() {
+        let with_scheme = format!("http://{}", text);
+        if let Ok(parsed) = url::Url::parse(&with_scheme)
+            && (parsed.scheme() == "http" || parsed.scheme() == "https")
+            && is_valid_portal_target(&parsed)
+        {
+            return Some(determine_login_target(&parsed, &with_scheme));
+        }
     }
 
     None
@@ -453,7 +503,9 @@ fn parse_probe_response(resp: reqwest::blocking::Response) -> ProbeResult {
         {
             let full_loc = if let Ok(u) = url::Url::parse(loc_str) {
                 u.to_string()
-            } else if let Ok(joined) = resp.url().join(loc_str) {
+            } else if resp.url().host_str().is_some_and(|h| !is_ignored_host(h))
+                && let Ok(joined) = resp.url().join(loc_str)
+            {
                 joined.to_string()
             } else {
                 loc_str.to_string()
@@ -1070,5 +1122,76 @@ mod tests {
         let result = submit_login_post(&client, &url, "user1", "P@ss&word=1+2%3");
         assert!(result.is_ok());
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_resolve_login_target_rejects_external_and_relative_filenames() {
+        // External URLs with login.xml must be rejected
+        assert_eq!(
+            resolve_login_target("https://evil.example.org/login.xml"),
+            None
+        );
+        assert_eq!(
+            resolve_login_target("http://evil.example.org:8090/httpclient.html"),
+            None
+        );
+
+        // Relative HTML constructs without private IP must be rejected (not converted to http://login.xml)
+        assert_eq!(resolve_login_target(r#"<form action="login.xml">"#), None);
+        assert_eq!(
+            resolve_login_target(r#"<script>window.location="httpclient.html"</script>"#),
+            None
+        );
+        assert_eq!(
+            resolve_login_target(r#"<form action="/php/uid.php">"#),
+            None
+        );
+    }
+
+    #[test]
+    fn test_is_compatible_gateway_subnet() {
+        use std::str::FromStr;
+
+        // Campus routed 10.x.x.x
+        let loc_10 = Ipv4Addr::from_str("10.20.1.5").unwrap();
+        let gw_10 = Ipv4Addr::from_str("10.1.1.9").unwrap();
+        assert!(is_compatible_gateway_subnet(
+            gw_10,
+            loc_10,
+            8090,
+            "/login.xml"
+        ));
+
+        // Campus routed 172.16-31
+        let loc_172 = Ipv4Addr::from_str("172.18.5.12").unwrap();
+        let gw_172 = Ipv4Addr::from_str("172.16.68.6").unwrap();
+        assert!(is_compatible_gateway_subnet(
+            gw_172,
+            loc_172,
+            8090,
+            "/login.xml"
+        ));
+
+        // Home 192.168.1.x: generic router without portal port/path must be rejected
+        let loc_192 = Ipv4Addr::from_str("192.168.1.50").unwrap();
+        let gw_192 = Ipv4Addr::from_str("192.168.1.1").unwrap();
+        assert!(!is_compatible_gateway_subnet(gw_192, loc_192, 80, "/"));
+        assert!(!is_compatible_gateway_subnet(gw_192, loc_192, 80, ""));
+
+        // Home 192.168.1.x: portal with explicit port 8090 or path is accepted
+        assert!(is_compatible_gateway_subnet(
+            gw_192,
+            loc_192,
+            8090,
+            "/login.xml"
+        ));
+
+        // Mismatched subnets (e.g. campus 10.x vs home 192.168.x) must be rejected
+        assert!(!is_compatible_gateway_subnet(
+            gw_192,
+            loc_10,
+            8090,
+            "/login.xml"
+        ));
     }
 }
