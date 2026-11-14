@@ -296,10 +296,14 @@ pub fn resolve_login_target(raw_redirect_or_html: &str) -> Option<(String, Strin
     candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
 
     for (_, raw_cand) in candidates {
+        if raw_cand.starts_with('/') {
+            continue;
+        }
+
         let normalized = if raw_cand.starts_with("http://") || raw_cand.starts_with("https://") {
             raw_cand
         } else {
-            format!("http://{}", raw_cand.trim_start_matches('/'))
+            format!("http://{}", raw_cand)
         };
 
         if let Ok(parsed) = url::Url::parse(&normalized)
@@ -390,7 +394,7 @@ fn send_probe_request(
 pub fn probe_url(client: &Client, url: &str, fallback_gateway: Option<&str>) -> ProbeResult {
     let res = send_probe_request(client, url);
     let probe_result = match res {
-        Ok(resp) => parse_probe_response(resp, fallback_gateway),
+        Ok(resp) => parse_probe_response(resp),
         Err(primary_err) => ProbeResult::ProbeTimeoutOrError(primary_err.to_string()),
     };
 
@@ -400,7 +404,7 @@ pub fn probe_url(client: &Client, url: &str, fallback_gateway: Option<&str>) -> 
     if url == FIREFOX_SUCCESS_URL && matches!(probe_result, ProbeResult::ProbeTimeoutOrError(_)) {
         // 1. Try GSTATIC_204_URL
         if let Ok(resp) = send_probe_request(client, GSTATIC_204_URL) {
-            let res2 = parse_probe_response(resp, fallback_gateway);
+            let res2 = parse_probe_response(resp);
             if !matches!(res2, ProbeResult::ProbeTimeoutOrError(_)) {
                 return res2;
             }
@@ -408,7 +412,7 @@ pub fn probe_url(client: &Client, url: &str, fallback_gateway: Option<&str>) -> 
 
         // 2. Try MSFT_CONNECTTEST_URL
         if let Ok(resp) = send_probe_request(client, MSFT_CONNECTTEST_URL) {
-            let res3 = parse_probe_response(resp, fallback_gateway);
+            let res3 = parse_probe_response(resp);
             if !matches!(res3, ProbeResult::ProbeTimeoutOrError(_)) {
                 return res3;
             }
@@ -422,10 +426,7 @@ pub fn probe_url(client: &Client, url: &str, fallback_gateway: Option<&str>) -> 
     }
 }
 
-fn parse_probe_response(
-    resp: reqwest::blocking::Response,
-    fallback_gateway: Option<&str>,
-) -> ProbeResult {
+fn parse_probe_response(resp: reqwest::blocking::Response) -> ProbeResult {
     let status = resp.status();
 
     // HTTP 204 No Content indicates Internet is unlocked
@@ -478,7 +479,7 @@ fn parse_probe_response(
         "Portal intercepted request (status {}) but gateway URL could not be resolved",
         status
     );
-    resolve_fallback_gateway(fallback_gateway, &err_msg)
+    ProbeResult::ProbeTimeoutOrError(err_msg)
 }
 
 /// Executes dynamic gateway discovery according to Firefox CaptiveDetect specifications
