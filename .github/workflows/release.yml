@@ -29,6 +29,9 @@ jobs:
           - os: macos-13
             target: x86_64-apple-darwin
             asset_name: ccp-darwin-amd64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: ccp-windows-amd64.zip
 
     steps:
       - name: Checkout repository
@@ -42,11 +45,18 @@ jobs:
       - name: Build binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package archive
+      - name: Package archive (Unix)
+        if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
           tar -czf ../../../${{ matrix.asset_name }} ccp
           cd ../../..
+
+      - name: Package archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/${{ matrix.target }}/release/ccp.exe -DestinationPath ${{ matrix.asset_name }}
 
       - name: Publish Release Asset
         uses: softprops/action-gh-release@v2

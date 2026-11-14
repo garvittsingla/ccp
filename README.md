@@ -1,10 +1,12 @@
 # CCP Captive Portal 
 
-While going from hostel to college and from college to hostel, there's always problem with my laptop connecting to wifi and opening captative portal, this is the same experienced by my fellow classmates and hostelmates.
+While going from hostel to college and from college to hostel, there's always a problem with laptops connecting to Wi-Fi and opening captive portals.
 
-So i thought why not fixing it with a simple cli tool which just saves your login details and automatically connect you with wifi and authenticate your captative portal.
+**ccp** is a lightweight, zero-lag CLI tool that stores your login details, dynamically discovers the local gateway using Firefox CaptiveDetect probe (<20ms), and automatically authenticates you across subnets.
 
 ## Installation
+
+### Linux, macOS & WSL
 
 Install in one command using `curl`:
 
@@ -12,7 +14,13 @@ Install in one command using `curl`:
 curl -fsSL https://raw.githubusercontent.com/garvittsingla/ccp/main/install.sh | bash
 ```
 
-> Works seamlessly on **macOS** (Apple Silicon & Intel), **Linux**, and **WSL**.
+### Windows (Native PowerShell)
+
+Install natively in Windows without WSL using PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/garvittsingla/ccp/main/install.ps1 | iex
+```
 
 ## Usage
 
@@ -27,6 +35,3 @@ Run `ccp` anytime you connect to Wi-Fi:
 ```bash
 ccp
 ```
-
-
-
