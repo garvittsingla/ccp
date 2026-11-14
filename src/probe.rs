@@ -7,15 +7,17 @@ use std::time::Duration;
 /// Canonical Firefox endpoint returning "success\n" (HTTP 200) when unlocked
 pub const FIREFOX_SUCCESS_URL: &str = "http://detectportal.firefox.com/success.txt";
 pub const FIREFOX_EXPECTED_BODY: &str = "success";
+/// Fallback Google connectivity check endpoint returning HTTP 204 No Content when unlocked
+pub const GSTATIC_204_URL: &str = "http://connectivitycheck.gstatic.com/generate_204";
 /// Fallback IPv4-literal probe if campus DNS drops external queries before auth
 pub const RAW_IP_FALLBACK_URL: &str = "http://1.1.1.1/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeResult {
-    /// Internet is already unlocked ("success" received)
+    /// Internet is already unlocked ("success" received or HTTP 204)
     OnlineUnlocked,
     /// Captive portal intercepted the probe; contains dynamically discovered gateway base URL
-    /// e.g. "http://172.16.68.6:8090" or "https://10.1.1.9:8090"
+    /// and target login URL (e.g. "/login.xml" for Sophos or preserved "/php/uid.php?..." for Palo Alto)
     LockedPortal {
         gateway_base: String,
         login_xml_url: String,
@@ -79,7 +81,7 @@ pub fn build_fast_client(follow_redirects: bool) -> Result<Client, reqwest::Erro
         .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)) // Force IPv4 (no AAAA timeout)
         .tcp_nodelay(true)
         .pool_max_idle_per_host(0) // Matches Firefox LOAD_FRESH_CONNECTION
-        .danger_accept_invalid_certs(true) // Campus :8090 portals use self-signed certs
+        .danger_accept_invalid_certs(true) // Campus portals use self-signed certs
         .redirect(if follow_redirects {
             Policy::limited(3)
         } else {
@@ -131,9 +133,14 @@ pub fn normalize_gateway_base(raw: &str) -> String {
     }
 }
 
-/// Extracts scheme://host[:port] gateway base from a URL string or an HTML body
-pub fn extract_gateway_base(url_or_html: &str) -> Option<String> {
-    let text = url_or_html.trim();
+/// Resolves the gateway base (scheme://host[:port]) and the exact login URL.
+///
+/// 1. If the extracted redirect URL has a non-root path/query (e.g. Palo Alto /php/uid.php?...)
+///    and does NOT end with /httpclient.html, the exact full URL is preserved as the login target.
+/// 2. If the URL has no path, ends with /httpclient.html (Sophos landing page), or is a bare host:port,
+///    the login target is format!("{gateway_base}/login.xml").
+pub fn resolve_login_target(raw_redirect_or_html: &str) -> Option<(String, String)> {
+    let text = raw_redirect_or_html.trim();
     if text.is_empty() {
         return None;
     }
@@ -144,12 +151,7 @@ pub fn extract_gateway_base(url_or_html: &str) -> Option<String> {
         && let Some(host) = parsed.host_str()
         && !is_ignored_host(host)
     {
-        return Some(format_gateway_base(
-            parsed.scheme(),
-            host,
-            parsed.port(),
-            text,
-        ));
+        return Some(determine_login_target(&parsed, text));
     }
 
     // 2. Scan for URLs within HTML / JS / text
@@ -175,7 +177,10 @@ pub fn extract_gateway_base(url_or_html: &str) -> Option<String> {
                     if raw_url.contains("httpclient") {
                         score += 50;
                     }
-                    if raw_url.contains("login.xml") {
+                    if raw_url.contains("login.xml")
+                        || raw_url.contains("/php/")
+                        || raw_url.contains("uid.php")
+                    {
                         score += 50;
                     }
                     if is_private_or_local_ip(host) {
@@ -188,9 +193,9 @@ pub fn extract_gateway_base(url_or_html: &str) -> Option<String> {
 
         candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
         if let Some((_, best, raw)) = candidates.into_iter().next()
-            && let Some(host) = best.host_str()
+            && best.host_str().is_some()
         {
-            return Some(format_gateway_base(best.scheme(), host, best.port(), &raw));
+            return Some(determine_login_target(&best, &raw));
         }
     }
 
@@ -201,21 +206,48 @@ pub fn extract_gateway_base(url_or_html: &str) -> Option<String> {
         && !is_ignored_host(host)
         && (is_private_or_local_ip(host) || parsed.port().is_some() || text.contains(":8090"))
     {
-        return Some(format_gateway_base("http", host, parsed.port(), text));
+        return Some(determine_login_target(&parsed, &with_scheme));
     }
 
     None
 }
 
+fn determine_login_target(parsed: &url::Url, raw_str: &str) -> (String, String) {
+    let scheme = parsed.scheme();
+    let host = parsed.host_str().unwrap_or("localhost");
+    let port = parsed.port();
+    let gateway_base = format_gateway_base(scheme, host, port, raw_str);
+
+    let path = parsed.path();
+    let query = parsed.query();
+    let has_non_root_path_or_query = (path != "/" && !path.is_empty()) || query.is_some();
+    let ends_with_httpclient = path.ends_with("/httpclient.html") || path == "httpclient.html";
+
+    let login_url = if has_non_root_path_or_query && !ends_with_httpclient {
+        // Keep exact full redirect URL (e.g. Palo Alto /php/uid.php?vsys=1...)
+        raw_str.to_string()
+    } else {
+        // Sophos / Cyberoam / default
+        format!("{}/login.xml", gateway_base.trim_end_matches('/'))
+    };
+
+    (gateway_base, login_url)
+}
+
+/// Extracts scheme://host[:port] gateway base from a URL string or an HTML body
+pub fn extract_gateway_base(url_or_html: &str) -> Option<String> {
+    resolve_login_target(url_or_html).map(|(base, _)| base)
+}
+
 fn resolve_fallback_gateway(fallback_gateway: Option<&str>, err_context: &str) -> ProbeResult {
     if let Some(fb) = fallback_gateway {
         if is_gateway_reachable(fb) {
-            let gateway_base = normalize_gateway_base(fb);
-            let login_xml_url = format!("{}/login.xml", gateway_base.trim_end_matches('/'));
-            return ProbeResult::LockedPortal {
-                gateway_base,
-                login_xml_url,
-            };
+            if let Some((gateway_base, login_xml_url)) = resolve_login_target(fb) {
+                return ProbeResult::LockedPortal {
+                    gateway_base,
+                    login_xml_url,
+                };
+            }
         } else {
             return ProbeResult::ProbeTimeoutOrError(format!(
                 "{}: cached gateway {} is unreachable on current network",
@@ -226,7 +258,7 @@ fn resolve_fallback_gateway(fallback_gateway: Option<&str>, err_context: &str) -
     ProbeResult::ProbeTimeoutOrError(err_context.to_string())
 }
 
-/// Probes a specific URL using the Firefox CaptiveDetect algorithm
+/// Probes a specific URL using the Firefox CaptiveDetect algorithm with GStatic fallback
 pub fn probe_url(client: &Client, url: &str, fallback_gateway: Option<&str>) -> ProbeResult {
     let req = client
         .get(url)
@@ -241,9 +273,22 @@ pub fn probe_url(client: &Client, url: &str, fallback_gateway: Option<&str>) -> 
     match req.send() {
         Ok(resp) => parse_probe_response(resp, fallback_gateway),
         Err(primary_err) => {
-            // DNS resolution failure / drop fallback:
-            // Query raw IP 1.1.1.1 with Host: detectportal.firefox.com
             if url == FIREFOX_SUCCESS_URL {
+                // 1. Try connectivitycheck.gstatic.com/generate_204 (from original main:src/main.rs line 61)
+                let gstatic_req = client
+                    .get(GSTATIC_204_URL)
+                    .header(CACHE_CONTROL, "no-cache")
+                    .header(PRAGMA, "no-cache")
+                    .header(CONNECTION, "close")
+                    .header(
+                        USER_AGENT,
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
+                    );
+                if let Ok(resp) = gstatic_req.send() {
+                    return parse_probe_response(resp, fallback_gateway);
+                }
+
+                // 2. Try raw IP 1.1.1.1 with Host: detectportal.firefox.com
                 let fb_req = client
                     .get(RAW_IP_FALLBACK_URL)
                     .header(reqwest::header::HOST, "detectportal.firefox.com")
@@ -270,14 +315,18 @@ fn parse_probe_response(
 ) -> ProbeResult {
     let status = resp.status();
 
+    // HTTP 204 No Content indicates Internet is unlocked
+    if status.as_u16() == 204 {
+        return ProbeResult::OnlineUnlocked;
+    }
+
     if status.is_success() {
         let body = resp.text().unwrap_or_default();
         if body.trim() == FIREFOX_EXPECTED_BODY {
             return ProbeResult::OnlineUnlocked;
         }
 
-        if let Some(gateway_base) = extract_gateway_base(&body) {
-            let login_xml_url = format!("{}/login.xml", gateway_base.trim_end_matches('/'));
+        if let Some((gateway_base, login_xml_url)) = resolve_login_target(&body) {
             return ProbeResult::LockedPortal {
                 gateway_base,
                 login_xml_url,
@@ -286,17 +335,15 @@ fn parse_probe_response(
     } else if status.is_redirection() || status.as_u16() == 511 {
         if let Some(loc) = resp.headers().get(reqwest::header::LOCATION)
             && let Ok(loc_str) = loc.to_str()
-            && let Some(gateway_base) = extract_gateway_base(loc_str)
+            && let Some((gateway_base, login_xml_url)) = resolve_login_target(loc_str)
         {
-            let login_xml_url = format!("{}/login.xml", gateway_base.trim_end_matches('/'));
             return ProbeResult::LockedPortal {
                 gateway_base,
                 login_xml_url,
             };
         }
         let body = resp.text().unwrap_or_default();
-        if let Some(gateway_base) = extract_gateway_base(&body) {
-            let login_xml_url = format!("{}/login.xml", gateway_base.trim_end_matches('/'));
+        if let Some((gateway_base, login_xml_url)) = resolve_login_target(&body) {
             return ProbeResult::LockedPortal {
                 gateway_base,
                 login_xml_url,
@@ -336,32 +383,23 @@ pub fn extract_xml_message(body: &str) -> Option<String> {
     None
 }
 
-/// Validates whether a Sophos/Cyberoam captive portal response represents a successful login.
-///
-/// Only treats the login as successful if the body contains "LIVE", "signed in",
-/// or "successfully logged in" (case-insensitive).
-/// If rejected, extracts the failure message from XML/CDATA and returns Err.
-pub fn validate_sophos_response(body: &str) -> Result<String, String> {
+/// Validates portal authentication responses, supporting Sophos XML, Cyberoam,
+/// and original main:src/main.rs HTTP status codes (200, 301, 302, 303).
+pub fn validate_portal_response(status_code: u16, body: &str) -> Result<String, String> {
     let body_lower = body.to_lowercase();
     let extracted_msg = extract_xml_message(body);
 
-    // Only treat the login as successful if the body contains "LIVE", "signed in",
-    // or "successfully logged in" (case-insensitive).
-    let is_success = body_lower.contains("live")
+    let has_success_keyword = body_lower.contains("live")
         || body_lower.contains("signed in")
         || body_lower.contains("successfully logged in");
 
-    if is_success {
-        let msg = extracted_msg.unwrap_or_else(|| "Authentication successful".to_string());
-        return Ok(msg);
-    }
-
-    // If XML body contains <message> without LIVE/signed in, extract it and return Err
-    if let Some(msg) = extracted_msg {
+    // 1. Explicit failure checks
+    if let Some(msg) = &extracted_msg
+        && !has_success_keyword
+    {
         return Err(format!("Portal rejected login: {}", msg));
     }
 
-    // Check for common captive portal failure messages
     let failure_keywords = [
         "invalid username",
         "invalid password",
@@ -371,6 +409,7 @@ pub fn validate_sophos_response(body: &str) -> Result<String, String> {
         "wrong password",
         "invalid credentials",
         "maximum login limit",
+        "make sure your password is correct",
         "account expired",
         "access denied",
     ];
@@ -381,10 +420,29 @@ pub fn validate_sophos_response(body: &str) -> Result<String, String> {
         }
     }
 
-    Err("Portal rejected login: Unrecognized response without LIVE status".to_string())
+    // 2. Explicit Sophos/text success
+    if has_success_keyword {
+        return Ok(extracted_msg.unwrap_or_else(|| "Authentication successful".to_string()));
+    }
+
+    // 3. Fallback matching main:src/main.rs (HTTP 200 | 301 | 302 | 303 without failure keywords)
+    let is_sophos_xml = body.contains("<requestresponse>") || body.contains("<status>");
+    if !is_sophos_xml && matches!(status_code, 200 | 301 | 302 | 303) {
+        return Ok("Login request completed.".to_string());
+    }
+
+    Err(format!(
+        "Portal rejected login: Unexpected response (HTTP {})",
+        status_code
+    ))
 }
 
-/// Submits url-encoded credentials to login.xml.
+/// Wrapper for validate_portal_response assuming HTTP 200
+pub fn validate_sophos_response(body: &str) -> Result<String, String> {
+    validate_portal_response(200, body)
+}
+
+/// Submits url-encoded credentials to the target login URL.
 /// Keys and values (including special characters like &, =, +, #, %) are properly URL-encoded.
 pub fn submit_login_post(
     client: &Client,
@@ -420,7 +478,7 @@ pub fn submit_login_post(
 }
 
 /// Authenticates to the captive portal with auto-retry between http and https,
-/// and validates the Sophos XML response body.
+/// and validates the portal response body and status code.
 pub fn post_login(
     client: &Client,
     login_xml_url: &str,
@@ -450,18 +508,13 @@ pub fn post_login(
     let body = resp.text().unwrap_or_default();
     println!("HTTP Status: {}", status.as_u16());
 
-    match validate_sophos_response(&body) {
+    match validate_portal_response(status.as_u16(), &body) {
         Ok(msg) => {
             println!("Login request completed: {}", msg);
             println!("Check your internet connection to confirm authentication.");
             Ok(())
         }
         Err(err_msg) => {
-            // Check follow-up probe_network in case portal unauthenticated silently
-            if probe_network(client, None) == ProbeResult::OnlineUnlocked {
-                println!("Login succeeded (confirmed via active probe).");
-                return Ok(());
-            }
             eprintln!("{}", err_msg);
             Err(err_msg.into())
         }
@@ -494,6 +547,16 @@ mod tests {
         let (url, handle) = spawn_mock_server(
             "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nsuccess\n",
         );
+        let client = build_fast_client(false).expect("Client build failed");
+        let result = probe_url(&client, &url, None);
+        handle.join().unwrap();
+        assert_eq!(result, ProbeResult::OnlineUnlocked);
+    }
+
+    #[test]
+    fn test_probe_204_no_content() {
+        let (url, handle) =
+            spawn_mock_server("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
         let client = build_fast_client(false).expect("Client build failed");
         let result = probe_url(&client, &url, None);
         handle.join().unwrap();
@@ -535,6 +598,43 @@ mod tests {
                 gateway_base: "https://10.1.1.9:8090".to_string(),
                 login_xml_url: "https://10.1.1.9:8090/login.xml".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn test_resolve_login_target_palo_alto_vs_sophos() {
+        // Palo Alto style redirect: preserves exact full URL with path and query
+        let pa_location = "https://172.16.1.1:6082/php/uid.php?vsys=1&rule=0";
+        let pa_result = resolve_login_target(pa_location);
+        assert_eq!(
+            pa_result,
+            Some((
+                "https://172.16.1.1:6082".to_string(),
+                "https://172.16.1.1:6082/php/uid.php?vsys=1&rule=0".to_string()
+            ))
+        );
+
+        // Sophos style redirect: ends with /httpclient.html, resolves to /login.xml
+        let sophos_location =
+            "http://172.16.68.6:8090/httpclient.html?u=http://detectportal.firefox.com/success.txt";
+        let sophos_result = resolve_login_target(sophos_location);
+        assert_eq!(
+            sophos_result,
+            Some((
+                "http://172.16.68.6:8090".to_string(),
+                "http://172.16.68.6:8090/login.xml".to_string()
+            ))
+        );
+
+        // Bare gateway: resolves to /login.xml
+        let bare = "http://172.16.68.6:8090";
+        let bare_result = resolve_login_target(bare);
+        assert_eq!(
+            bare_result,
+            Some((
+                "http://172.16.68.6:8090".to_string(),
+                "http://172.16.68.6:8090/login.xml".to_string()
+            ))
         );
     }
 
@@ -613,6 +713,29 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_portal_response_status_codes() {
+        // Fallback for non-Sophos portals: HTTP 200 without failure keywords
+        let non_sophos_html =
+            "<html><body>Welcome to Palo Alto Networks Captive Portal</body></html>";
+        let res = validate_portal_response(200, non_sophos_html);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), "Login request completed.");
+
+        // HTTP 302 redirect on login success
+        let res_302 = validate_portal_response(302, "");
+        assert!(res_302.is_ok());
+
+        // HTTP 200 with explicit failure keyword
+        let failure_html = "<html><body>Authentication failed. Please try again.</body></html>";
+        let res_fail = validate_portal_response(200, failure_html);
+        assert!(res_fail.is_err());
+        assert_eq!(
+            res_fail.unwrap_err(),
+            "Portal rejected login: authentication failed"
+        );
+    }
+
+    #[test]
     fn test_cached_gateway_reachability() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -620,7 +743,6 @@ mod tests {
         assert!(is_gateway_reachable(&active_gw));
 
         drop(listener);
-        // After dropping, port is no longer listening
         assert!(!is_gateway_reachable(&active_gw));
     }
 

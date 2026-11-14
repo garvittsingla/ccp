@@ -1,4 +1,4 @@
-﻿# Windows PowerShell installation script for ccp
+# Windows PowerShell installation script for ccp
 [CmdletBinding()]
 param(
     [string]$Version = $env:CCP_VERSION,

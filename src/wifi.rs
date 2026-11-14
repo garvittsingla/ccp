@@ -83,6 +83,9 @@ pub fn connect_wifi(ssid: Option<&str>) -> std::io::Result<()> {
         let _ = Command::new("nmcli")
             .args(["dev", "wifi", "connect", s])
             .output();
+    } else {
+        let _ = Command::new("nmcli").args(["radio", "wifi", "on"]).output();
+        let _ = Command::new("nmcli").args(["networking", "on"]).output();
     }
     Ok(())
 }
@@ -93,6 +96,10 @@ pub fn connect_wifi(ssid: Option<&str>) -> std::io::Result<()> {
     if let Some(s) = ssid {
         let _ = Command::new("networksetup")
             .args(["-setairportnetwork", "en0", s])
+            .output();
+    } else {
+        let _ = Command::new("networksetup")
+            .args(["-setairportpower", "en0", "on"])
             .output();
     }
     Ok(())
