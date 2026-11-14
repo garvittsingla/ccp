@@ -35,7 +35,7 @@ try {
     Invoke-WebRequest -Uri $DownloadUrl -OutFile $ArchiveFile -UseBasicParsing
     
     if (-not (Test-Path $ArchiveFile)) {
-        Write-Error "❌ Download failed: archive file was not found."
+        Write-Error "[ERROR] Download failed: archive file was not found."
         exit 1
     }
 
@@ -45,7 +45,7 @@ try {
     $ExtractedExe = Get-ChildItem -Path $TempDir -Filter $BinaryName -Recurse -File | Select-Object -First 1
 
     if (-not $ExtractedExe) {
-        Write-Error "❌ Could not find $BinaryName in downloaded archive."
+        Write-Error "[ERROR] Could not find $BinaryName in downloaded archive."
         exit 1
     }
 
@@ -56,7 +56,7 @@ try {
     $TargetExe = Join-Path $InstallDir $BinaryName
     Copy-Item -Path $ExtractedExe.FullName -Destination $TargetExe -Force
 
-    Write-Host "✅ ccp installed to $TargetExe" -ForegroundColor Green
+    Write-Host "[OK] ccp installed to $TargetExe" -ForegroundColor Green
 
     # Check and update User PATH
     $UserPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::User)
@@ -64,14 +64,14 @@ try {
 
     if ($PathParts -notcontains $InstallDir) {
         Write-Host ""
-        Write-Host "⚠️  $InstallDir is not in your User PATH." -ForegroundColor Yellow
+        Write-Host "[WARN] $InstallDir is not in your User PATH." -ForegroundColor Yellow
         Write-Host "Adding $InstallDir to your User PATH..." -ForegroundColor Cyan
 
         $NewPath = if ([string]::IsNullOrWhiteSpace($UserPath)) { $InstallDir } else { "$UserPath;$InstallDir" }
         [Environment]::SetEnvironmentVariable("Path", $NewPath, [EnvironmentVariableTarget]::User)
         $env:PATH = "$env:PATH;$InstallDir"
 
-        Write-Host "✅ Added $InstallDir to User PATH." -ForegroundColor Green
+        Write-Host "[OK] Added $InstallDir to User PATH." -ForegroundColor Green
         Write-Host "Please restart your terminal or PowerShell window for PATH changes to take effect." -ForegroundColor Yellow
     }
 

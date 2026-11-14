@@ -389,7 +389,8 @@ pub fn validate_portal_response(status_code: u16, body: &str) -> Result<String, 
     let body_lower = body.to_lowercase();
     let extracted_msg = extract_xml_message(body);
 
-    let has_success_keyword = body_lower.contains("live")
+    let has_success_keyword = body_lower.contains("<status>live</status>")
+        || body_lower.contains("[cdata[live]]")
         || body_lower.contains("signed in")
         || body_lower.contains("successfully logged in");
 
@@ -450,31 +451,52 @@ pub fn submit_login_post(
     username: &str,
     password: &str,
 ) -> Result<reqwest::blocking::Response, reqwest::Error> {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let is_sophos = url.contains("login.xml") || url.contains(":8090");
 
-    let params = [
-        ("mode", "191"),
-        ("username", username),
-        ("password", password),
-        ("a", &now_ms.to_string()),
-        ("producttype", "0"),
-        ("inputStr", ""),
-        ("escapeUser", username),
-        ("preauthid", ""),
-        ("user", username),
-        ("passwd", password),
-        ("ok", "Login"),
-    ];
+    if is_sophos {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
 
-    client
-        .post(url)
-        .header(CACHE_CONTROL, "no-cache")
-        .header(CONNECTION, "close")
-        .form(&params)
-        .send()
+        let params = [
+            ("mode", "191"),
+            ("username", username),
+            ("password", password),
+            ("a", &now_ms.to_string()),
+            ("producttype", "0"),
+            ("inputStr", ""),
+            ("escapeUser", username),
+            ("preauthid", ""),
+            ("user", username),
+            ("passwd", password),
+            ("ok", "Login"),
+        ];
+
+        client
+            .post(url)
+            .header(CACHE_CONTROL, "no-cache")
+            .header(CONNECTION, "close")
+            .form(&params)
+            .send()
+    } else {
+        // Exact 6 form parameters from main:src/main.rs (Palo Alto / generic)
+        let params = [
+            ("inputStr", ""),
+            ("escapeUser", username),
+            ("preauthid", ""),
+            ("user", username),
+            ("passwd", password),
+            ("ok", "Login"),
+        ];
+
+        client
+            .post(url)
+            .header(CACHE_CONTROL, "no-cache")
+            .header(CONNECTION, "close")
+            .form(&params)
+            .send()
+    }
 }
 
 /// Authenticates to the captive portal with auto-retry between http and https,
@@ -779,6 +801,39 @@ mod tests {
                 );
 
                 let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: 104\r\nConnection: close\r\n\r\n<requestresponse><status><![CDATA[LIVE]]></status><message><![CDATA[OK]]></message></requestresponse>";
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let client = build_fast_client(false).unwrap();
+        let result = submit_login_post(&client, &url, "user1", "P@ss&word=1+2%3");
+        assert!(result.is_ok());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_submit_login_post_palo_alto_params() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock listener");
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/php/uid.php");
+
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+
+                // Verify exact 6 params from main:src/main.rs (without mode=191)
+                assert!(
+                    !request.contains("mode=191"),
+                    "Palo Alto target should not contain mode=191"
+                );
+                assert!(request.contains("user=user1"));
+                assert!(request.contains("passwd=P%40ss%26word%3D1%2B2%253"));
+                assert!(request.contains("ok=Login"));
+
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
                 let _ = stream.write_all(resp.as_bytes());
                 let _ = stream.flush();
             }

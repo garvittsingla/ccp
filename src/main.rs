@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 login_xml_url,
             } => {
                 println!("Portal detected at: {}", gateway_base);
-                set_cached_gateway(&gateway_base);
+                set_cached_gateway(&login_xml_url);
                 probe::post_login(&client, &login_xml_url, username, password)?;
                 return Ok(());
             }
@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 login_xml_url,
                             } => {
                                 println!("Portal detected at: {}", gateway_base);
-                                set_cached_gateway(&gateway_base);
+                                set_cached_gateway(&login_xml_url);
                                 probe::post_login(&client, &login_xml_url, username, password)?;
                             }
                             ProbeResult::InterfaceOffline => {
@@ -109,12 +109,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             ProbeResult::ProbeTimeoutOrError(e) => {
                                 eprintln!("Probe failed after Wi-Fi connect: {}", e);
-                                if let Some(gw) = cached_gateway {
-                                    let fallback_url =
-                                        format!("{}/login.xml", gw.trim_end_matches('/'));
-                                    println!("Attempting fallback login at: {}", fallback_url);
-                                    probe::post_login(&client, &fallback_url, username, password)?;
-                                }
                             }
                         }
                     }
@@ -127,13 +121,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             ProbeResult::ProbeTimeoutOrError(err_msg) => {
                 eprintln!("Network probe error: {}", err_msg);
-                if let Some(gw) = cached_gateway {
-                    let fallback_url = format!("{}/login.xml", gw.trim_end_matches('/'));
-                    println!("Attempting cached gateway fallback: {}", fallback_url);
-                    probe::post_login(&client, &fallback_url, username, password)?;
-                } else {
-                    println!("Unable to detect portal and no cached gateway is available.");
-                }
                 return Ok(());
             }
         }
